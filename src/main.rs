@@ -10,7 +10,10 @@ use base64::prelude::*;
 use clap::Parser;
 use console::style;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{InputCallbackInfo, OutputCallbackInfo, SampleFormat};
+use cpal::{
+    InputCallbackInfo, OutputCallbackInfo, SampleFormat, SampleRate,
+    SupportedStreamConfig, SupportedStreamConfigRange,
+};
 use dotenv::dotenv;
 use futures_util::{SinkExt, StreamExt};
 use http::Request;
@@ -35,9 +38,6 @@ struct Args {
     #[arg(short, long, default_value_t = 60)]
     max_time: u64,
 }
-
-// All the struct definitions were replaced with direct JSON manipulation
-// using serde_json::json! macro, so they're no longer needed
 
 /// Structure to hold recipe information
 struct Recipe {
@@ -93,17 +93,13 @@ impl RecipeDatabase {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Parse command line arguments
     let args = Args::parse();
 
-    // Load environment variables from .env file
     dotenv().ok();
 
-    // Get OpenAI API key
     let api_key = env::var("OPENAI_API_KEY")
         .context("OPENAI_API_KEY must be set in .env file or environment")?;
 
-    // Load recipe database
     let recipe_db = Arc::new(
         RecipeDatabase::new(&args.recipes_path).context("Failed to load recipe database")?,
     );
@@ -122,37 +118,45 @@ async fn main() -> Result<()> {
         args.max_time
     );
 
-    // Set up audio input
     let host = cpal::default_host();
     let device = host
         .default_input_device()
         .context("No input audio device available")?;
-    let config = device
-        .default_input_config()
-        .context("Failed to get default input config")?;
+
+    let input_supported_config_range: SupportedStreamConfigRange = device
+        .supported_input_configs()?
+        .filter(|c| c.sample_format() == SampleFormat::F32 && c.channels() == 1)
+        .find(|c| c.min_sample_rate().0 <= 24_000 && c.max_sample_rate().0 >= 24_000)
+        .expect("No mono-PCM16 range at 24 kHz");
+
+    // NOTE: 24kHz because that is what OpenAI wants
+    let input_supported_config: SupportedStreamConfig =
+        input_supported_config_range.with_sample_rate(SampleRate(24_000));
 
     println!("Audio input device: {}", device.name()?);
     println!(
         "Sample format: {:?}, Sample rate: {}",
-        config.sample_format(),
-        config.sample_rate().0
+        input_supported_config.sample_format(),
+        input_supported_config.sample_rate().0
     );
 
-    // Create channels for audio data (input)
     let (tx, rx) = mpsc::channel::<Vec<u8>>(32);
     let rx = Arc::new(Mutex::new(rx));
-    
-    // Create channel for audio output
+
     let (audio_out_tx, audio_out_rx) = mpsc::channel::<Vec<u8>>(32);
     let audio_out_rx = Arc::new(Mutex::new(audio_out_rx));
 
-    // Set up audio output
     let output_device = host
         .default_output_device()
         .context("No output audio device available")?;
-    let output_config = output_device
-        .default_output_config()
-        .context("Failed to get default output config")?;
+
+    let output_supported_config = output_device
+        .supported_output_configs()?
+        .filter(|cfg| cfg.sample_format() == SampleFormat::F32)
+        .find(|cfg| cfg.min_sample_rate().0 <= 24_000 && cfg.max_sample_rate().0 >= 24_000)
+        .context("No supported config at 24 kHz")?;
+    let output_config: SupportedStreamConfig =
+        output_supported_config.with_sample_rate(SampleRate(24_000));
 
     println!("Audio output device: {}", output_device.name()?);
     println!(
@@ -161,16 +165,22 @@ async fn main() -> Result<()> {
         output_config.sample_rate().0
     );
 
-    // Generate a unique session ID
     let session_id = Uuid::new_v4().to_string();
 
-    // Start recording and connecting to OpenAI in separate tasks
-    let sample_rate = config.sample_rate().0;
-    let audio_task = tokio::spawn(record_audio(device, config, tx, args.max_time));
-    
-    // Start audio output task
-    let audio_out_task = tokio::spawn(play_audio(output_device, output_config, audio_out_rx.clone()));
-    
+    let sample_rate = input_supported_config.sample_rate().0;
+    let audio_task = tokio::spawn(record_audio(
+        device,
+        input_supported_config,
+        tx,
+        args.max_time,
+    ));
+
+    let audio_out_task = tokio::spawn(play_audio(
+        output_device,
+        output_config,
+        audio_out_rx.clone(),
+    ));
+
     let openai_task = tokio::spawn(connect_to_openai(
         api_key,
         sample_rate,
@@ -186,10 +196,9 @@ async fn main() -> Result<()> {
     );
     println!("Wait for a response or press Ctrl+C to stop.");
 
-    // Wait for all tasks to complete
-    let (audio_result, audio_out_result, openai_result) = tokio::join!(audio_task, audio_out_task, openai_task);
+    let (audio_result, audio_out_result, openai_result) =
+        tokio::join!(audio_task, audio_out_task, openai_task);
 
-    // Propagate any errors from the tasks
     audio_result??;
     audio_out_result??;
     openai_result??;
@@ -219,30 +228,6 @@ async fn record_audio(
             err_fn,
             None,
         )?,
-        SampleFormat::I16 => device.build_input_stream(
-            &config.into(),
-            move |data: &[i16], _: &InputCallbackInfo| {
-                let mut bytes = Vec::with_capacity(data.len() * 2);
-                for &sample in data {
-                    bytes.extend_from_slice(&sample.to_le_bytes());
-                }
-                let _ = tx_clone.try_send(bytes);
-            },
-            err_fn,
-            None,
-        )?,
-        SampleFormat::U16 => device.build_input_stream(
-            &config.into(),
-            move |data: &[u16], _: &InputCallbackInfo| {
-                let mut bytes = Vec::with_capacity(data.len() * 2);
-                for &sample in data {
-                    bytes.extend_from_slice(&sample.to_le_bytes());
-                }
-                let _ = tx_clone.try_send(bytes);
-            },
-            err_fn,
-            None,
-        )?,
         _ => {
             return Err(anyhow::anyhow!(
                 "Unsupported sample format: {:?}",
@@ -253,10 +238,8 @@ async fn record_audio(
 
     stream.play()?;
 
-    // Stop recording after max_seconds
     let _ = tokio::time::sleep(Duration::from_secs(max_seconds));
 
-    // Explicitly drop the stream to stop recording
     drop(stream);
 
     Ok(())
@@ -267,7 +250,7 @@ async fn connect_to_openai(
     _sample_rate: u32,
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     recipe_db: Arc<RecipeDatabase>,
-    _session_id: String, // Unused, we get a new session ID from the API
+    _session_id: String,
     audio_out_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     println!("Establishing connection to OpenAI API...");
@@ -275,7 +258,6 @@ async fn connect_to_openai(
     let url = format!("wss://api.openai.com/v1/realtime?model={}", OPENAI_MODEL);
     println!("WebSocket URL: {}", url);
 
-    // Build the WebSocket request with the ephemeral key
     let req = Request::builder()
         .uri(url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -299,23 +281,17 @@ async fn connect_to_openai(
 
     println!("Connected to OpenAI API");
 
-    // Use two MPSC channels for communication:
+    // NOTE: Use two MPSC channels for communication:
     // 1. For sending audio data
     // 2. For sending tool results
     let (audio_tx, mut audio_rx) = mpsc::channel::<String>(32);
     let (tool_result_tx, mut tool_result_rx) = mpsc::channel::<String>(32);
 
-    // The session is already initialized through the REST API
-    // Now we'll just set up the WebSocket for sending audio and receiving responses
-
-    // Split the WebSocket stream
     let (mut write, mut read) = ws_stream.split();
 
     println!("WebSocket connection established, ready to stream audio");
 
-    // Spawn a task to handle WebSocket writes
     let writer_task = tokio::spawn(async move {
-        // First, send session.update to configure the session
         let session_update = json!({
             "type": "session.update",
             "session": {
@@ -364,7 +340,6 @@ async fn connect_to_openai(
 
         println!("Sent session configuration");
 
-        // Process messages from both channels
         loop {
             tokio::select! {
                 Some(audio_msg) = audio_rx.recv() => {
@@ -382,16 +357,12 @@ async fn connect_to_openai(
         }
     });
 
-    // Spawn a task to process audio data
     let audio_task = tokio::spawn(async move {
         let mut rx_guard = rx.lock().await;
 
-        // Send audio data
         while let Some(audio_chunk) = rx_guard.recv().await {
-            // Encode audio data as base64
             let audio_base64 = BASE64_STANDARD.encode(&audio_chunk);
 
-            // Send audio data using input_audio_buffer.append
             let audio_message = json!({
                 "type": "input_audio_buffer.append",
                 "audio": audio_base64
@@ -402,15 +373,12 @@ async fn connect_to_openai(
             }
         }
 
-        // When VAD is enabled, we don't need to explicitly commit
-        // But for completeness, we'll send the commit message followed by response.create
         let commit_message = json!({
             "type": "input_audio_buffer.commit"
         });
 
         let _ = audio_tx.send(commit_message.to_string()).await;
 
-        // Create a response after committing the audio buffer
         let response_message = json!({
             "type": "response.create"
         });
@@ -418,12 +386,9 @@ async fn connect_to_openai(
         let _ = audio_tx.send(response_message.to_string()).await;
     });
 
-    // Process incoming messages
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                // Print raw message for debugging
-                //println!("Received: {}", text);
 
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -433,7 +398,6 @@ async fn connect_to_openai(
                     }
                 };
 
-                // Extract message type
                 let msg_type = parsed["type"].as_str().unwrap_or("unknown");
                 println!("Message type: {}", msg_type);
 
@@ -467,10 +431,8 @@ async fn connect_to_openai(
                     }
                     "response.audio.delta" => {
                         if let Some(audio_base64) = parsed["delta"].as_str() {
-                            // Decode base64 audio data
                             match BASE64_STANDARD.decode(audio_base64) {
                                 Ok(audio_data) => {
-                                    // Send audio data to output channel
                                     if let Err(e) = audio_out_tx.try_send(audio_data) {
                                         eprintln!("Failed to send audio data to output: {}", e);
                                     }
@@ -491,10 +453,8 @@ async fn connect_to_openai(
                         println!("\n{}", style("Response fully completed").bold());
                     }
                     "response.output_item.added" => {
-                        // Check if this is a function call
                         if let Some(item) = parsed["item"].as_object() {
                             if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                                // Extract tool information
                                 let function_call_id = item
                                     .get("call_id")
                                     .and_then(|id| id.as_str())
@@ -512,18 +472,14 @@ async fn connect_to_openai(
                                 );
 
                                 if function_name == "find_recipe" {
-                                    // Parse the arguments
                                     let args: serde_json::Value =
                                         serde_json::from_str(arguments).unwrap_or(json!({}));
 
-                                    // Extract query parameter
                                     let query = args["query"].as_str().unwrap_or("");
                                     println!("Searching for recipe with query: {}", query);
 
-                                    // Search the recipe database
                                     let results = recipe_db.search(query);
 
-                                    // Format the results
                                     let output = if results.is_empty() {
                                         json!({
                                             "status": "not_found",
@@ -547,7 +503,6 @@ async fn connect_to_openai(
                                         })
                                     };
 
-                                    // Send the function call output
                                     let tool_result = json!({
                                         "type": "conversation.item.create",
                                         "item": {
@@ -561,7 +516,6 @@ async fn connect_to_openai(
                                     println!("Sending function call output: {}", result_json);
                                     let _ = tool_result_tx.send(result_json).await;
 
-                                    // Create a response after sending the function call output
                                     let response_create = json!({
                                         "type": "response.create"
                                     });
@@ -575,7 +529,6 @@ async fn connect_to_openai(
                         eprintln!("{}", parsed);
                     }
                     _ => {
-                        // For debugging, print all message types
                         println!("Received message type: {}", msg_type);
                     }
                 }
@@ -592,14 +545,11 @@ async fn connect_to_openai(
         }
     }
 
-    // When we reach this point, the WebSocket connection is closed
-    // Wait for the writer task and audio task to complete
     let _ = tokio::join!(writer_task, audio_task);
 
     Ok(())
 }
 
-/// Generate a random WebSocket key as per RFC 6455
 fn generate_websocket_key() -> String {
     let mut rng = rand::thread_rng();
     let mut key = [0u8; 16];
@@ -612,13 +562,10 @@ async fn play_audio(
     config: cpal::SupportedStreamConfig,
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
 ) -> Result<()> {
-    let err_fn = |err: cpal::StreamError| eprintln!("Audio output error: {}", err);
-    
-    // Create a stream to handle audio playback and handle it in a separate function
-    // This approach avoids Send/Sync issues with cpal::Stream
+    let _err_fn = |err: cpal::StreamError| eprintln!("Audio output error: {}", err);
+
     let _stream = setup_audio_playback(device, config, rx.clone())?;
-    
-    // Keep the function alive
+
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -630,12 +577,10 @@ fn setup_audio_playback(
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
 ) -> Result<()> {
     let err_fn = |err: cpal::StreamError| eprintln!("Audio output error: {}", err);
-    
-    // Move receiver to a thread-safe location that can be accessed from the callback
+
     let audio_buffer: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
     let audio_buffer_clone = audio_buffer.clone();
-    
-    // Spawn a regular thread (not a tokio task) to handle the audio receiving
+
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -647,42 +592,35 @@ fn setup_audio_playback(
             }
         });
     });
-    
+
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
             device.build_output_stream(
                 &config.into(),
                 move |data: &mut [f32], _: &OutputCallbackInfo| {
-                    // Get audio data from the shared buffer
                     let mut buffer_lock = match audio_buffer.try_lock() {
                         Ok(guard) => guard,
-                        Err(_) => return,  // Skip this callback if buffer is locked
+                        Err(_) => return,
                     };
-                    
+
                     if buffer_lock.len() >= 2 {
-                        // Process PCM16 bytes to f32 samples
                         let mut i = 0;
                         while i + 1 < buffer_lock.len() && i / 2 < data.len() {
-                            // Correctly interpret as signed 16-bit PCM
-                            let pcm16 = i16::from_le_bytes([buffer_lock[i], buffer_lock[i+1]]);
-                            // Convert to float in range [-1.0, 1.0]
-                            data[i/2] = pcm16 as f32 / 32767.0;
+                            let pcm16 = i16::from_le_bytes([buffer_lock[i], buffer_lock[i + 1]]);
+                            data[i / 2] = pcm16 as f32 / 32767.0;
                             i += 2;
                         }
-                        
-                        // Remove processed bytes
+
                         if i > 0 {
                             buffer_lock.drain(0..i);
                         }
-                        
-                        // Zero out the rest of the buffer if not enough samples
-                        if i/2 < data.len() {
-                            for sample in &mut data[i/2..] {
+
+                        if i / 2 < data.len() {
+                            for sample in &mut data[i / 2..] {
                                 *sample = 0.0;
                             }
                         }
                     } else {
-                        // No data available, output silence
                         for sample in data.iter_mut() {
                             *sample = 0.0;
                         }
@@ -691,92 +629,7 @@ fn setup_audio_playback(
                 err_fn,
                 None,
             )?
-        },
-        SampleFormat::I16 => {
-            device.build_output_stream(
-                &config.into(),
-                move |data: &mut [i16], _: &OutputCallbackInfo| {
-                    // Get audio data from the shared buffer
-                    let mut buffer_lock = match audio_buffer.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => return,  // Skip this callback if buffer is locked
-                    };
-                    
-                    if buffer_lock.len() >= 2 {
-                        // Process PCM16 bytes to i16 samples - direct conversion
-                        let mut i = 0;
-                        while i + 1 < buffer_lock.len() && i / 2 < data.len() {
-                            // PCM16 data is already in i16 format
-                            data[i/2] = i16::from_le_bytes([buffer_lock[i], buffer_lock[i+1]]);
-                            i += 2;
-                        }
-                        
-                        // Remove processed bytes
-                        if i > 0 {
-                            buffer_lock.drain(0..i);
-                        }
-                        
-                        // Zero out the rest of the buffer if not enough samples
-                        if i/2 < data.len() {
-                            for sample in &mut data[i/2..] {
-                                *sample = 0;
-                            }
-                        }
-                    } else {
-                        // No data available, output silence
-                        for sample in data.iter_mut() {
-                            *sample = 0;
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )?
-        },
-        SampleFormat::U16 => {
-            device.build_output_stream(
-                &config.into(),
-                move |data: &mut [u16], _: &OutputCallbackInfo| {
-                    // Get audio data from the shared buffer
-                    let mut buffer_lock = match audio_buffer.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => return,  // Skip this callback if buffer is locked
-                    };
-                    
-                    if buffer_lock.len() >= 2 {
-                        // Process PCM16 bytes to u16 samples (with proper offset)
-                        let mut i = 0;
-                        while i + 1 < buffer_lock.len() && i / 2 < data.len() {
-                            // Convert signed PCM16 to unsigned u16
-                            let i16_sample = i16::from_le_bytes([buffer_lock[i], buffer_lock[i+1]]);
-                            // Add 32768 to shift from [-32768,32767] to [0,65535]
-                            let u16_sample = (i16_sample as i32 + 32768) as u16;
-                            data[i/2] = u16_sample;
-                            i += 2;
-                        }
-                        
-                        // Remove processed bytes
-                        if i > 0 {
-                            buffer_lock.drain(0..i);
-                        }
-                        
-                        // Zero out the rest of the buffer if not enough samples
-                        if i/2 < data.len() {
-                            for sample in &mut data[i/2..] {
-                                *sample = 32768;  // Middle value for u16 (silence)
-                            }
-                        }
-                    } else {
-                        // No data available, output silence
-                        for sample in data.iter_mut() {
-                            *sample = 32768;  // Middle value for u16 (silence)
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )?
-        },
+        }
         _ => {
             return Err(anyhow::anyhow!(
                 "Unsupported sample format: {:?}",
@@ -785,14 +638,11 @@ fn setup_audio_playback(
         }
     };
 
-    // Play the stream
     stream.play()?;
-    
-    // Keep the stream alive by storing it in a global or static variable
-    // We use a Box leak to ensure it stays alive for the program duration
+
     Box::leak(Box::new(stream));
-    
+
     println!("Audio output initialized and playing");
-    
+
     Ok(())
 }

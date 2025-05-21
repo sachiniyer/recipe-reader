@@ -22,6 +22,8 @@ use serde_json::json;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::{debug, error, info};
+use tracing_subscriber::{self};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -93,6 +95,10 @@ impl RecipeDatabase {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing subscriber
+    tracing_subscriber::fmt()
+        .init();
+    
     let args = Args::parse();
 
     dotenv().ok();
@@ -104,16 +110,16 @@ async fn main() -> Result<()> {
         RecipeDatabase::new(&args.recipes_path).context("Failed to load recipe database")?,
     );
 
-    println!(
+    info!(
         "{}",
         style("Recipe Reader - Voice Assistant").bold().green()
     );
-    println!(
+    info!(
         "Loaded {} recipes from {}",
         recipe_db.recipes.len(),
         args.recipes_path.display()
     );
-    println!(
+    info!(
         "Press Enter to start recording (max {} seconds)",
         args.max_time
     );
@@ -133,8 +139,8 @@ async fn main() -> Result<()> {
     let input_supported_config: SupportedStreamConfig =
         input_supported_config_range.with_sample_rate(SampleRate(24_000));
 
-    println!("Audio input device: {}", device.name()?);
-    println!(
+    info!("Audio input device: {}", device.name()?);
+    info!(
         "Sample format: {:?}, Sample rate: {}",
         input_supported_config.sample_format(),
         input_supported_config.sample_rate().0
@@ -158,8 +164,8 @@ async fn main() -> Result<()> {
     let output_config: SupportedStreamConfig =
         output_supported_config.with_sample_rate(SampleRate(24_000));
 
-    println!("Audio output device: {}", output_device.name()?);
-    println!(
+    info!("Audio output device: {}", output_device.name()?);
+    info!(
         "Output format: {:?}, Sample rate: {}",
         output_config.sample_format(),
         output_config.sample_rate().0
@@ -190,11 +196,11 @@ async fn main() -> Result<()> {
         audio_out_tx,
     ));
 
-    println!(
+    info!(
         "{}",
         style("Recording started... Speak your recipe question.").bold()
     );
-    println!("Wait for a response or press Ctrl+C to stop.");
+    info!("Wait for a response or press Ctrl+C to stop.");
 
     let (audio_result, audio_out_result, openai_result) =
         tokio::join!(audio_task, audio_out_task, openai_task);
@@ -212,7 +218,7 @@ async fn record_audio(
     tx: mpsc::Sender<Vec<u8>>,
     max_seconds: u64,
 ) -> Result<()> {
-    let err_fn = |err| eprintln!("Audio input error: {}", err);
+    let err_fn = |err| error!("Audio input error: {}", err);
     let tx_clone = tx.clone();
 
     let stream = match config.sample_format() {
@@ -253,10 +259,10 @@ async fn connect_to_openai(
     _session_id: String,
     audio_out_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    println!("Establishing connection to OpenAI API...");
+    info!("Establishing connection to OpenAI API...");
 
     let url = format!("wss://api.openai.com/v1/realtime?model={}", OPENAI_MODEL);
-    println!("WebSocket URL: {}", url);
+    debug!("WebSocket URL: {}", url);
 
     let req = Request::builder()
         .uri(url)
@@ -271,15 +277,15 @@ async fn connect_to_openai(
         .body(())
         .context("Failed to build WebSocket request")?;
 
-    println!("Connecting to OpenAI Audio WebSocket API...");
+    info!("Connecting to OpenAI Audio WebSocket API...");
 
     let (ws_stream, response) = connect_async(req)
         .await
         .context("Failed to connect to OpenAI WebSocket API")?;
 
-    println!("Connected to OpenAI API (HTTP {})", response.status());
+    info!("Connected to OpenAI API (HTTP {})", response.status());
 
-    println!("Connected to OpenAI API");
+    info!("Connected to OpenAI API");
 
     // NOTE: Use two MPSC channels for communication:
     // 1. For sending audio data
@@ -289,7 +295,7 @@ async fn connect_to_openai(
 
     let (mut write, mut read) = ws_stream.split();
 
-    println!("WebSocket connection established, ready to stream audio");
+    info!("WebSocket connection established, ready to stream audio");
 
     let writer_task = tokio::spawn(async move {
         let session_update = json!({
@@ -338,7 +344,7 @@ async fn connect_to_openai(
             return;
         }
 
-        println!("Sent session configuration");
+        info!("Sent session configuration");
 
         loop {
             tokio::select! {
@@ -369,21 +375,10 @@ async fn connect_to_openai(
             });
 
             if audio_tx.send(audio_message.to_string()).await.is_err() {
+                error!("Failure to send audio message");
                 break;
             }
         }
-
-        let commit_message = json!({
-            "type": "input_audio_buffer.commit"
-        });
-
-        let _ = audio_tx.send(commit_message.to_string()).await;
-
-        let response_message = json!({
-            "type": "response.create"
-        });
-
-        let _ = audio_tx.send(response_message.to_string()).await;
     });
 
     while let Some(msg) = read.next().await {
@@ -393,32 +388,32 @@ async fn connect_to_openai(
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("Failed to parse response as JSON: {}", e);
+                        error!("Failed to parse response as JSON: {}", e);
                         continue;
                     }
                 };
 
                 let msg_type = parsed["type"].as_str().unwrap_or("unknown");
-                println!("Message type: {}", msg_type);
+                debug!("Message type: {}", msg_type);
 
                 match msg_type {
                     "session.created" => {
-                        println!("Session created successfully");
+                        info!("Session created successfully");
                     }
                     "session.updated" => {
-                        println!("Session updated successfully");
+                        info!("Session updated successfully");
                     }
                     "input_audio_buffer.speech_started" => {
-                        println!("Speech detected, listening...");
+                        info!("Speech detected, listening...");
                     }
                     "input_audio_buffer.speech_stopped" => {
-                        println!("Speech stopped");
+                        info!("Speech stopped");
                     }
                     "input_audio_buffer.committed" => {
-                        println!("Audio buffer committed");
+                        info!("Audio buffer committed");
                     }
                     "response.created" => {
-                        println!("Response creation started");
+                        info!("Response creation started");
                     }
                     "response.text.delta" => {
                         if let Some(delta) = parsed["delta"]["text"].as_str() {
@@ -427,30 +422,30 @@ async fn connect_to_openai(
                         }
                     }
                     "response.audio_transcript.delta" => {
-                        println!("Audio transcript delta received");
+                        debug!("Audio transcript delta received");
                     }
                     "response.audio.delta" => {
                         if let Some(audio_base64) = parsed["delta"].as_str() {
                             match BASE64_STANDARD.decode(audio_base64) {
                                 Ok(audio_data) => {
                                     if let Err(e) = audio_out_tx.try_send(audio_data) {
-                                        eprintln!("Failed to send audio data to output: {}", e);
+                                        error!("Failed to send audio data to output: {}", e);
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("Failed to decode audio data: {}", e);
+                                    error!("Failed to decode audio data: {}", e);
                                 }
                             }
                         }
                     }
                     "response.audio.done" => {
-                        println!("\n{}", style("Audio response completed").bold());
+                        info!("\n{}", style("Audio response completed").bold());
                     }
                     "response.text.done" => {
-                        println!("\n{}", style("Text response completed").bold());
+                        info!("\n{}", style("Text response completed").bold());
                     }
                     "response.done" => {
-                        println!("\n{}", style("Response fully completed").bold());
+                        info!("\n{}", style("Response fully completed").bold());
                     }
                     "response.output_item.added" => {
                         if let Some(item) = parsed["item"].as_object() {
@@ -466,7 +461,7 @@ async fn connect_to_openai(
                                     .and_then(|a| a.as_str())
                                     .unwrap_or("{}");
 
-                                println!(
+                                info!(
                                     "Function call: {} with arguments: {}",
                                     function_name, arguments
                                 );
@@ -476,7 +471,7 @@ async fn connect_to_openai(
                                         serde_json::from_str(arguments).unwrap_or(json!({}));
 
                                     let query = args["query"].as_str().unwrap_or("");
-                                    println!("Searching for recipe with query: {}", query);
+                                    info!("Searching for recipe with query: {}", query);
 
                                     let results = recipe_db.search(query);
 
@@ -513,7 +508,7 @@ async fn connect_to_openai(
                                     });
 
                                     let result_json = tool_result.to_string();
-                                    println!("Sending function call output: {}", result_json);
+                                    debug!("Sending function call output: {}", result_json);
                                     let _ = tool_result_tx.send(result_json).await;
 
                                     let response_create = json!({
@@ -526,19 +521,19 @@ async fn connect_to_openai(
                         }
                     }
                     "error" => {
-                        eprintln!("{}", parsed);
+                        error!("{}", parsed);
                     }
                     _ => {
-                        println!("Received message type: {}", msg_type);
+                        debug!("Received message type: {}", msg_type);
                     }
                 }
             }
             Ok(Message::Close(_)) => {
-                println!("\n{}", style("Connection closed by server").bold());
+                info!("\n{}", style("Connection closed by server").bold());
                 break;
             }
             Err(e) => {
-                eprintln!("WebSocket error: {}", e);
+                error!("WebSocket error: {}", e);
                 break;
             }
             _ => {}
@@ -562,7 +557,7 @@ async fn play_audio(
     config: cpal::SupportedStreamConfig,
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
 ) -> Result<()> {
-    let _err_fn = |err: cpal::StreamError| eprintln!("Audio output error: {}", err);
+    let _err_fn = |err: cpal::StreamError| error!("Audio output error: {}", err);
 
     let _stream = setup_audio_playback(device, config, rx.clone())?;
 
@@ -576,7 +571,7 @@ fn setup_audio_playback(
     config: cpal::SupportedStreamConfig,
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
 ) -> Result<()> {
-    let err_fn = |err: cpal::StreamError| eprintln!("Audio output error: {}", err);
+    let err_fn = |err: cpal::StreamError| error!("Audio output error: {}", err);
 
     let audio_buffer: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
     let audio_buffer_clone = audio_buffer.clone();
@@ -642,7 +637,7 @@ fn setup_audio_playback(
 
     Box::leak(Box::new(stream));
 
-    println!("Audio output initialized and playing");
+    info!("Audio output initialized and playing");
 
     Ok(())
 }
